@@ -1,0 +1,3 @@
+# Local preview config - override the remote_theme with the local theme gem.
+# Build with: bundle exec jekyll serve --config _config.yml,_config.local.yml
+theme: stygian

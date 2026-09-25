@@ -1,0 +1,72 @@
+# ksau-blogs - Sauraj's engineering blog - Stygian theme (blog mode)
+# Renderer: https://github.com/ksauraj/stygian (just-the-docs style)
+title: Sauraj's Blog
+url: "https://blog.ksauraj.eu.org"
+baseurl: ""
+description: >-
+  Engineering notes on Kubernetes, containers, networking and DevOps:
+  deep dives, complete guides and hard-won production lessons.
+
+remote_theme: ksauraj/stygian
+
+# ------------------------------------------------------------------ build
+markdown: kramdown
+highlighter: rouge
+kramdown:
+  input: GFM
+  auto_ids: true
+  hard_wrap: false
+  syntax_highlighter: rouge
+  syntax_highlighter_opts:
+    block:
+      line_numbers: false
+
+exclude:
+  - README.md
+  - vendor
+
+# ------------------------------------------------------------------ content
+# The `posts` collection is Jekyll's built-in blog collection. Posts live
+# under _posts/ as YYYY-MM-DD-slug.md; the permalink below keeps them at
+# /<year>/<month>/<day>/<slug>/ like most blogs.
+collections:
+  posts:
+    output: true
+    permalink: /:collection/:year/:month/:day/:title/
+
+defaults:
+  - scope:
+      path: ""
+      type: posts
+    values:
+      layout: blog
+
+# no plugins needed: GitHub Pages injects jekyll-remote-theme automatically
+# for `remote_theme`. For local development, build with an extra config file
+# that sets `theme: stygian` against a path-installed gem.
+
+# ------------------------------------------------------------------ navigation
+just_the_docs:
+  collections:
+    posts:
+      name: Posts
+      sort_by: date      # chronological, newest first
+
+stygian:
+  header:
+    aux_links_new_tab: true
+    aux_links:
+      - { label: GitHub, href: https://github.com/ksauraj }
+  nav:
+    collection: posts    # posts lead the sidebar
+  theme:
+    default: dark
+  syntax_highlighting:
+    enabled: true
+  feed:
+    limit: 50
+  seo:
+    enabled: true
+  footer:
+    note: Sauraj's engineering blog
+    right: "© 2026 ksauraj"
