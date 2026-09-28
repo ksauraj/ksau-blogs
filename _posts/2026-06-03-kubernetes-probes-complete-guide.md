@@ -237,22 +237,24 @@ The interplay between the five timing parameters is the most misunderstood part 
 A critical implementation detail in kubelet: when a probe response takes longer than `timeoutSeconds`, kubelet records the probe as failed **and also resets its internal timer**. This means the next probe fires `periodSeconds` after the timeout completes, not `periodSeconds` after the *scheduled* time.
 
 ```mermaid
-gantt
-    title Probe Timing with Drift
-    dateFormat  X
-    axisFormat %s
+sequenceDiagram
+    participant KL as kubelet
+    participant APP as Application
 
-    section Normal timeline
-    Probe 1 (success, 50ms)     : 0, 50ms
-    Wait periodSeconds 10s      : 50ms, 10050ms
-    Probe 2 (success, 30ms)     : 10050ms, 10080ms
-    Wait periodSeconds 10s      : 10080ms, 20080ms
+    Note over KL,APP: Normal schedule<br/>(timeout < period)
+    KL->>APP: probe (t=0)
+    APP-->>KL: 200 OK in 50ms
+    KL->>KL: next probe at t + 10s
+    KL->>APP: probe (t=10s)
+    APP-->>KL: 200 OK in 30ms
 
-    section Under load - timeout
-    Probe 3 (timeout at 3s)     : 20080ms, 23080ms
-    Wait periodSeconds 10s      : 23080ms, 33080ms
-    Probe 4 (starts late)       : 33080ms, 33120ms
-    Wait periodSeconds 10s      : 33120ms, 43120ms
+    Note over KL,APP: Under load - a timeout drifts the schedule
+    KL->>APP: probe (t=20s)
+    APP-->>KL: timeout at t=23s (took 3s)
+    Note over KL: next probe fires at t=33s<br/>(period after the timeout ends,<br/>not after the scheduled time)
+    KL->>APP: probe (t=33s, started late)
+    APP-->>KL: 200 OK in 40ms
+    KL->>KL: next probe at t=43s
 ```
 
 Under load, each timeout pushes subsequent probes later and later. If `timeoutSeconds` is close to `periodSeconds` (say 8s and 10s), a single timeout causes the probe schedule to drift by nearly a full period. On a node with hundreds of Pods, this drift can cause **probe storms** where many Pods get probed simultaneously - increasing load on the application and causing further timeouts in a cascading failure.
