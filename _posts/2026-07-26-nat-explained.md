@@ -6,9 +6,9 @@ excerpt: "One idea - rewriting addresses in flight - quietly powers your home Wi
 tags: ["networking", "nat", "docker", "kubernetes", "devops"]
 ---
 
-Network Address Translation is one of those concepts you can use for years without ever really *seeing* it. It hides behind your home router, behind `docker run`, behind every `ClusterIP` service in Kubernetes. And it's all the same core trick: **a device in the middle rewrites the addresses on packets as they pass through, and remembers enough to rewrite the replies back.**
+Network Address Translation is one of those concepts you can use for years without ever really *seeing* it. It hides behind your home router, behind `docker run`, behind every `ClusterIP` service in Kubernetes - in kube-proxy's default iptables mode, at least. And it's all the same core trick: **a device in the middle rewrites the addresses on packets as they pass through, and remembers enough to rewrite the replies back.**
 
-This post builds NAT from the ground up - the plain networking idea first, then exactly how Docker uses it to give containers connectivity, and finally how Kubernetes layers its whole service model on top of the same primitive.
+This post builds NAT from the ground up - the plain networking idea first, then exactly how Docker uses it to give containers connectivity, and finally how Kubernetes layers its service model on top of the same primitive - in iptables mode, where the NAT story lives.
 
 ## Why NAT exists at all
 
@@ -64,7 +64,7 @@ Hold onto these two. **Docker and Kubernetes are almost entirely built out of SN
 
 ## NAT in Docker
 
-When you `docker run` a container, it gets its own network namespace with its own private IP - by default on the `172.17.0.0/16` bridge network. That IP is as unroutable to the outside world as your laptop's `192.168.x.x`. Docker makes containers work using exactly the same NAT trick your router uses, by default implemented with **iptables** rules on the host (recent Docker can use an nftables backend instead). It's also worth knowing that NAT is a choice here, not a requirement: Docker's **routed mode** gives containers routable IPs and skips translation entirely.
+When you `docker run` a container, it gets its own network namespace with its own private IP - by default on the `172.17.0.0/16` bridge network. That IP is as unroutable to the outside world as your laptop's `192.168.x.x`. Docker makes containers work using exactly the same NAT trick your router uses, by default implemented with **iptables** rules on the host (recent Docker can use an nftables backend instead). It's also worth knowing that NAT is a choice here, not a requirement: **routed bridge mode** skips NAT if clients can route to the container subnet.
 
 ```mermaid
 graph LR
@@ -83,7 +83,7 @@ graph LR
     IPT --- NET["Internet"]
 ```
 
-**Outbound (container → internet): SNAT / masquerade.** Container A (`172.17.0.2`) wants to `apt update`. Its packet leaves with a source of `172.17.0.2`, which the internet can't reply to. Docker installs a masquerade rule so the host rewrites the source to the host's own IP on the way out - identical to your router. You can see the actual rule:
+**Outbound (container → internet): SNAT / masquerade.** Container A (`172.17.0.2`) wants to `apt update`. Its packet leaves with a source of `172.17.0.2`, which the internet can't reply to. Docker installs a masquerade rule so the host rewrites the source to the host's own IP on the way out - identical to your router. You can see a simplified version of the rule (the real one also has `! -o docker0`, so bridge-local traffic is never rewritten):
 
 ```bash
 $ iptables -t nat -L POSTROUTING -n
@@ -109,7 +109,7 @@ target  prot opt source     destination
 DNAT    tcp  --  0.0.0.0/0  0.0.0.0/0  tcp dpt:8080 to:172.17.0.2:80
 ```
 
-So the whole `docker run -p` model - the thing you use every day - is a DNAT rule. The replies come back through conntrack: the kernel tracks the connection and automatically reverses the DNAT on the return packets - it's not a masquerade rule doing that work. When you understand NAT, `-p host:container` stops being magic and becomes obvious: left side is the host port people connect to, right side is the DNAT target inside.
+So the whole `docker run -p` model - the thing you use every day - is a DNAT rule, on a typical Linux bridge in NAT mode. The replies come back through conntrack: the kernel tracks the connection and automatically reverses the DNAT on the return packets - it's not a masquerade rule doing that work. When you understand NAT, `-p host:container` stops being magic and becomes obvious: left side is the host port people connect to, right side is the DNAT target inside.
 
 > **Why containers on the same bridge reach each other without NAT:** they're on the same `172.17.0.0/16` subnet, bridged at L2 by `docker0`. No translation needed - it's a plain local network. NAT only kicks in crossing the boundary between the private container net and the outside.
 
@@ -161,13 +161,13 @@ Here's the kind of rule chain kube-proxy installs (iptables mode) - a DNAT to a 
 -A KUBE-SEP-AAA -p tcp -j DNAT --to-destination 10.244.2.4:8080
 ```
 
-That's the entire Service abstraction, demystified: statistical load-balancing plus DNAT.
+That's the entire Service abstraction in iptables mode, demystified: statistical load-balancing plus DNAT.
 
 ### NodePort, external traffic, and the SNAT gotcha
 
-For `type: NodePort` / `LoadBalancer`, external traffic hits a node on a high port and gets **DNAT'd** to a backend pod - possibly a pod on a *different* node. Here's the subtle part that trips people up: to make the return path work, kube-proxy usually also **SNATs** that traffic (masquerades it to the node's IP). The problem it solves is routing, not politeness: the external client's connection was established *to the node*, so the reply has to come back through that same node - only then can conntrack reverse the DNAT. If the backend pod replied directly with its own source IP, the reply would bypass the node entirely and the client would drop it as not belonging to any connection it opened.
+For `type: NodePort` / `LoadBalancer`, external traffic hits a node on a high port and gets **DNAT'd** to a backend pod - possibly a pod on a *different* node. Here's the subtle part that trips people up: to make the return path work, kube-proxy usually also **SNATs** that traffic (masquerades it to the node's IP). The problem it solves is routing, not politeness: the external client's connection was established *to the node*, so the reply has to come back through that same node - only then can conntrack reverse the DNAT. If the backend pod replied directly with its own source IP, the reply may bypass conntrack on the ingress node, breaking the connection.
 
-The tradeoff: that SNAT **hides the client's real source IP** from your application (it sees the node IP instead). The fix is `externalTrafficPolicy: Local`, which only routes to pods on the receiving node and skips the SNAT - preserving the real client IP at the cost of even load distribution. Two caveats: a node with no local pod **drops the traffic** (which is why load balancer health checks exist - they only route to nodes that actually have a pod), and if an upstream LB or proxy already replaced the client's source IP before it reached you, `Local` won't bring it back - the rewritten address is all you get.
+The tradeoff: that SNAT **hides the client's real source IP** from your application (it sees the node IP instead). The fix is `externalTrafficPolicy: Local`, which only routes to pods on the receiving node and skips the SNAT - preserving the real client IP at the cost of even load distribution. Two caveats: a node with no local pod **drops the traffic** (for LoadBalancer Services, health checks let the load balancer avoid nodes with no local endpoint - plain NodePort traffic has no load balancer to do that), and if an upstream LB or proxy already replaced the client's source IP before it reached you, `Local` won't bring it back - the rewritten address is all you get.
 
 ```mermaid
 graph LR
@@ -178,7 +178,7 @@ graph LR
 
 ### Egress: pods reaching the internet
 
-And finally, the loop closes right back to where we started. When a pod dials out to the public internet, its `10.244.x.x` source is - you guessed it - unroutable outside the cluster. So the node **masquerades (SNAT)** the pod's traffic to the node's own IP on the way out, exactly like Docker's `docker0` masquerade, exactly like your home router. One honest caveat: that egress masquerade isn't built into Kubernetes itself - it comes from your **CNI plugin** (or the `ip-masq-agent` for fine-grained control), and some setups deliberately skip NAT entirely by routing pod IPs or using egress gateways. But in the common default, it's the same trick at a third scale.
+And finally, the loop closes right back to where we started. When a pod dials out to the public internet, its `10.244.x.x` source is - you guessed it - unroutable outside the cluster. So **a common setup SNATs** the pod's traffic to the node's own IP on the way out - via the **CNI plugin** or the `ip-masq-agent` - exactly like Docker's `docker0` masquerade, exactly like your home router. That masquerade isn't built into Kubernetes itself, and it isn't the only option: some setups **route pod CIDRs** out without NAT, and **egress gateways** SNAT to a selected gateway IP instead of the node's. In the common default, though, it's the same trick at a third scale.
 
 ## The one mental model to keep
 
@@ -188,6 +188,6 @@ Strip away the layers and it's a single idea appearing three times:
 
 - **Home router:** SNAT out (share one public IP), DNAT in (port forwarding).
 - **Docker:** masquerade out (`docker0` → internet), DNAT in (`-p 8080:80`).
-- **Kubernetes:** DNAT for Services (ClusterIP → pod), SNAT for NodePort return paths, and egress masquerade via the CNI; pod-to-pod stays NAT-free by design.
+- **Kubernetes:** DNAT for Services (ClusterIP → pod, in iptables mode), SNAT for NodePort return paths, and egress SNAT via the CNI or ip-masq-agent; pod-to-pod stays NAT-free by design.
 
 Once you see the pattern, `iptables -t nat -L` stops being intimidating and starts reading like a story: *who's being rewritten, in which direction, and how the reply finds its way home.* That story is the same whether it's your living room or a 500-node cluster.
