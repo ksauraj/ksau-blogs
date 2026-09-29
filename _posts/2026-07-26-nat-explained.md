@@ -2,7 +2,7 @@
 layout: blog
 title: "NAT, Demystified: From Your Home Router to Docker and Kubernetes"
 date: "2026-07-26"
-excerpt: "One idea - rewriting addresses in flight - quietly powers your home Wi-Fi, every Docker container, and the pod network in Kubernetes. This is NAT from first principles up to kube-proxy."
+excerpt: "One idea - rewriting addresses in flight - quietly powers home-router sharing, Docker's common bridge setup, and Kubernetes Service routing in kube-proxy's iptables mode. This is NAT from first principles up to kube-proxy."
 tags: ["networking", "nat", "docker", "kubernetes", "devops"]
 ---
 
@@ -60,7 +60,7 @@ Two terms you'll hit constantly, especially in Docker and Kubernetes:
 - **SNAT (Source NAT)** - rewrite the *source* address of outgoing packets. This is the home-router case above: private clients reaching out. Masquerading is dynamic SNAT (source IP picked from whatever the outgoing interface has).
 - **DNAT (Destination NAT)** - rewrite the *destination* address of incoming packets. This is **port forwarding**: "traffic hitting my public IP on port 8080 → send it to `192.168.1.50:80` inside." This is how you expose an internal service to the outside.
 
-Hold onto these two. **Docker and Kubernetes are almost entirely built out of SNAT + DNAT rules.**
+Hold onto these two. In the common Linux bridge and kube-proxy iptables setups, SNAT and DNAT explain many of the packet paths we'll look at.
 
 ## NAT in Docker
 
@@ -161,7 +161,7 @@ Here's the kind of rule chain kube-proxy installs (iptables mode) - a DNAT to a 
 -A KUBE-SEP-AAA -p tcp -j DNAT --to-destination 10.244.2.4:8080
 ```
 
-That's the entire Service abstraction in iptables mode, demystified: statistical load-balancing plus DNAT.
+At the packet level, that's the core Service routing path in kube-proxy's iptables mode: backend selection and DNAT.
 
 ### NodePort, external traffic, and the SNAT gotcha
 
