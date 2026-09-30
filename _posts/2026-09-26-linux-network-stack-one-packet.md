@@ -79,21 +79,30 @@ the TCP layer. This is where the famous TCP behavior lives.
 The key concept is the **MTU** (Maximum Transmission Unit) - the largest
 packet the link can carry, usually 1500 bytes on Ethernet. Your app may call
 `send()` with 64 KB of data, but the kernel cannot put 64 KB in one Ethernet
-frame. So the TCP layer **segments** the data into chunks that fit:
+frame. So the TCP layer **segments** the data into chunks that fit. On a plain
+IPv4 connection over a 1500-byte MTU link with no TCP options, that is 1460
+bytes of payload per packet:
 
 ```text
 your 64 KB write()  →  ~44 packets of ~1460 bytes each
 ```
 
+One nuance: if the NIC supports **TSO/GSO** (TCP/generic segmentation
+offload), the kernel may hand the NIC one large buffer and let the hardware do
+the actual splitting, which saves CPU. The segmentation still happens - just
+later, in the NIC.
+
 Each segment gets a sequence number, a destination port, a window size, and
-gets queued for transmission. If the other side does not acknowledge them fast
-enough, the sender's **congestion window** shrinks and it sends more slowly.
-That slow start / congestion avoidance dance is the core of TCP and it all
-happens here, invisibly, inside the kernel.
+gets queued for transmission. The sender's **congestion window** - how much
+in-flight data it allows itself - grows as acknowledgements come back (that is
+the slow start / congestion avoidance dance), and it only **shrinks on
+congestion signals**: packet loss, or explicit congestion notification (ECN).
+Slow acknowledgements alone do not shrink it. All of this happens invisibly,
+inside the kernel.
 
 The kernel does one more thing here: it attaches a **socket buffer** (`skb`)
-with all the TCP headers filled in use, ready for the next layer. It then asks
-the routing layer: *which interface does this destination use, and what is the
+with all the TCP headers filled in, ready for the next layer. It then asks the
+routing layer: *which interface does this destination use, and what is the
 next hop?*
 
 ## The IP and routing layer: picking the exit
@@ -116,20 +125,22 @@ Before a packet can reach the NIC driver, it sits in a **qdisc** (queueing
 discipline). This is a userspace-visible, tunable queue - you have seen it
 with `tc` (traffic control).
 
-By default, most interfaces use a simple FIFO queue (`pfifo_fast`). But the
-qdisc is where the kernel does its shaping: `tc` can add a `htb` or `fq_codel`
-qdisc that reorders, drops, or rate-limits packets. This is the queue that
-determines a packet's **latency** under load - the one that makes `ping` spike
-when the link is saturated.
+The qdisc is where the kernel does its shaping: `tc` can attach anything from
+a simple FIFO to `htb` (classful rate limiting) or `fq_codel` (fair queuing
+with controlled delay). The default varies by distro and kernel - older setups
+use `pfifo_fast`, many modern ones ship `fq_codel` - so check yours with
+`tc qdisc show`. This is the queue that determines a packet's **latency**
+under load - the one that makes `ping` spike when the link is saturated.
 
 The qdisc hands packets to the NIC driver one at a time, when the driver says
 it can accept more.
 
 ## The NIC driver and the ring buffer
 
-Now we are at the bottom. The **NIC driver** owns two ring buffers - one for
-transmit (TX) and one for receive (RX) - and the **DMA ring** is the actual
-hardware interface.
+Now we are at the bottom. A NIC has one or more **TX and RX queues** - modern
+multi-queue NICs expose one queue pair per CPU core, tuned with `ethtool -L` -
+and each queue is backed by a **DMA ring**: a ring of descriptors pointing at
+kernel memory where the packet data lives.
 
 The driver allocates a set of **descriptors** (small structures pointing at
 kernel memory where the packet data lives) and hands them to the NIC. The NIC
@@ -138,8 +149,10 @@ RAM and onto the wire - the CPU does not copy the bytes one at a time. The
 hardware does the copy in parallel while the CPU does other work.
 
 This is the key to high-performance networking: the CPU sets up the descriptor,
-the hardware does the bulk copy, and the CPU only gets interrupted when the
-packet is fully gone.
+the hardware does the bulk copy, and the CPU only hears about it when the
+packet is gone. NICs also **coalesce** completions - they batch many finished
+packets into one interrupt instead of interrupting per packet (`ethtool -c`
+tunes this).
 
 ```text
 CPU    →  builds skb, fills descriptor, tells NIC "go"
@@ -154,21 +167,32 @@ important difference: the CPU gets interrupted a lot more.
 
 1. The NIC receives bytes and **DMA-writes** them into the RX ring buffer -
    kernel memory it has been told about in advance.
-2. The NIC raises a **hard IRQ**. The kernel's interrupt handler does the
-   minimum - it acknowledges the hardware and schedules a **softirq**.
-3. A **softirq** (software interrupt, running in kernel context but allowed to
-   be deferred and preempted) runs on a CPU core and pulls packets out of the
-   RX ring.
-4. The softirq walks the packet up: IP reassembly, TCP delivery, and finally
+2. The first packet of a burst raises a **hard IRQ**. The kernel's interrupt
+   handler does the minimum - it acknowledges the hardware and schedules a
+   **softirq**.
+3. The **softirq** (deferred kernel work that runs outside hard-interrupt
+   context, on a CPU core) pulls packets out of the RX ring.
+4. The softirq walks each packet up: IP reassembly, TCP delivery, and finally
    waking your process by putting the data into the socket's receive queue.
 5. Your process's `recv()` returns with the data.
 
 The receive path is why people say network performance is about **interrupt
-mitigation**. Each incoming packet is an interrupt, and a machine drowning in
-interrupts spends all its time being interrupted instead of doing work. Modern
-drivers use **NAPI** (New API) - they switch from interrupt mode to *polling*
-mode when packets arrive faster than a threshold, letting the CPU process many
-packets per interrupt.
+mitigation**. The trick modern drivers use is **NAPI** (New API). On the first
+packet, the interrupt handler does not just schedule work - it also **disables
+that queue's RX interrupts**. A poll loop then drains a whole batch of packets
+from the ring with interrupts still masked, and only when the ring is empty
+does the driver **re-enable interrupts** and go quiet again. The result: under
+load you take far fewer interrupts, and each one buys you many packets.
+
+```mermaid
+graph LR
+    NIC2["NIC hardware"] -->|"DMA into RX ring"| RING["RX ring buffer"]
+    RING -->|"first packet: hard IRQ"| IRQ["interrupt handler"]
+    IRQ -->|"disable RX IRQs<br/>+ schedule poll"| NAPI["NAPI poll<br/>(softirq)"]
+    NAPI -->|"drain batch,<br/>walk stack"| SOCK2["socket receive queue"]
+    NAPI -->|"ring empty:<br/>re-enable IRQs"| NIC2
+    SOCK2 -->|"recv() returns"| PROC["your process"]
+```
 
 ## Why this matters: three practical lessons
 
@@ -184,19 +208,27 @@ The fix is usually **RPS** (Receive Packet Steering) or a multi-queue NIC
 
 ### Lesson 2: Why tuning the NIC ring matters
 
-The RX ring has a finite size. If the softirq cannot drain it fast enough, the
-ring fills and the NIC starts dropping packets (`ethtool -S` shows `rx_dropped`
-climbing). Raising the ring size (`ethtool -G eth0 rx 4096`) gives the kernel
-more headroom, at the cost of memory and latency. This is a concrete lever you
-can pull today.
+The RX ring has a finite size, and when it overflows the NIC starts dropping
+packets. But do not conclude "ring overflow" from `rx_dropped` alone - that
+generic counter also counts drops for other reasons. Check the NIC-specific
+counters in `ethtool -S` first (`rx_missed_errors`, `rx_fifo_errors`,
+`rx_no_buffer_count`). If the ring really is the bottleneck, raising its size
+(`ethtool -G eth0 rx 4096`) gives the kernel more headroom. That helps with
+**bursts** - a spike that briefly outruns the CPU - but it is not a fix for
+sustained overload: if the softirq cannot keep up on average, no ring size
+saves you; you need more cores, RPS, or less traffic.
 
 ### Lesson 3: Why `tc` and qdiscs add latency
 
-Every qdisc is a queue, and queues add delay. A default FIFO queue holds
-packets in order, so a burst of bulk transfers queues a small interactive
-packet behind them - that is your `ping` spike. `fq_codel` (the fair queue
-controlled delay) exists precisely to give small interactive flows priority
-and keep latency low. That is why modern distros default to it.
+Every qdisc is a queue, and queues add delay. A plain FIFO queue holds
+packets in strict arrival order, so a burst of bulk transfers queues a small
+interactive packet behind them - that is your `ping` spike. `fq_codel` attacks
+that from two directions at once: the **fq** (fair queuing) half gives each
+flow its own queue so one bulk flow cannot crowd everyone else, and the
+**CoDel** (controlled delay) half drops or marks packets when a queue stays
+full for too long, which keeps latency bounded. It does not "prioritize small
+packets" - it keeps each flow fair and each queue short, and that is what
+protects interactive traffic.
 
 ## The one mental model to keep
 

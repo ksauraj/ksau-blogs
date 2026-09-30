@@ -58,10 +58,10 @@ everything in the group combined. A container is really just a group: the
 kernel puts every process of the container into one cgroup and applies limits
 to that group.
 
-The second-generation implementation is called **cgroups v2**, which shipped
-stable in kernel 4.15 (2018) and is the default on every modern Linux
-distribution. We use v2 throughout, and I flag the few places where the older
-v1 behaved differently.
+The second-generation implementation is called **cgroups v2**. It first
+appeared in kernel 4.5 (2016) and is now what modern distributions and
+container runtimes use. We use v2 throughout, and I flag the few places where
+the older v1 behaved differently.
 
 ## The mental model: a hierarchy of boxes
 
@@ -102,36 +102,49 @@ cpuset cpu io memory hugetlb pids
 That tells you which resource controllers this host supports - CPU, IO,
 memory, process counts, and more. Each controller is a resource you can limit.
 
-Now create a cgroup and put a process into it:
+Now create a cgroup and put a process into it. This is a v2 lab example - it
+needs root, and on a systemd-based host you would normally create slices via
+`systemd-run` rather than touch the tree by hand:
 
 ```bash
-# Create a new cgroup called 'myapp'
+# 1. Create a new cgroup called 'myapp' (needs root)
 $ sudo mkdir /sys/fs/cgroup/myapp
 
-# Give it a memory limit of 100 MB
-$ echo 104857600 > /sys/fs/cgroup/myapp/memory.max
+# 2. Enable the controllers you want to use in the parent subtree first
+$ echo "+cpu +memory +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
 
-# Put our shell (and its children) into the group
-$ echo $$ > /sys/fs/cgroup/myapp/cgroup.procs
+# 3. Give it a memory limit of 100 MB
+$ echo 104857600 | sudo tee /sys/fs/cgroup/myapp/memory.max
+
+# 4. Put our shell (and its children) into the group
+$ echo $$ | sudo tee /sys/fs/cgroup/myapp/cgroup.procs
 ```
+
+A v2 detail is hidden in step 2: a controller is only usable in a child cgroup
+if the parent has first enabled it in its `cgroup.subtree_control` file. Skip
+that step and `memory.max` will not exist inside `myapp`. (The plain
+`echo > file` in steps 3-4 would also fail without root - the writes need to
+go through `sudo tee`.)
 
 That is the whole magic. You just created a memory cap, and the kernel will
 now enforce it on everything in `myapp`. If processes in the group try to use
 more than 100 MB, they get slowed down, and if they keep going, they get
 killed. No daemon, no magic - just the kernel reading a number out of a file.
 
-## The CPU controller: shares, not seconds
+## The CPU controller: shares and caps
 
 The most intuitive-sounding limit - CPU - is also the one that trips people
-up, because it does not work the way you expect.
+up, because the controller gives you two different knobs and they work
+completely differently. Confusing them is the single most common cgroups
+mistake.
 
 CPU time is not a thing you can bank. The kernel cannot give a process "half
 a second and hold the rest". It schedules processes onto cores thousands of
 times a second, and the only meaningful question is: *when two processes both
 want the CPU, who gets it?*
 
-The CPU controller answers with **shares** - relative weights, not absolute
-quotas.
+The first knob is **shares** (`cpu.weight`) - relative weights, not absolute
+amounts:
 
 ```text
 container-a   cpu.weight = 100
@@ -176,23 +189,27 @@ CPU.
 /sys/fs/cgroup/myapp/memory.max  →  1073741824   (1 GB, in bytes)
 ```
 
-The kernel watches how much anonymous memory - heap, stack, anonymous mmaps -
-the processes in the group are using. When they approach the ceiling, the
-kernel starts reclaiming: it pushes clean pages to disk, drops caches. When
-there is nothing left to reclaim, it has one final tool - the **OOM killer**.
+The kernel watches how much memory the group has been charged with - and that
+is more than just the anonymous heap and stack. **Page cache** and kernel
+memory count toward the limit too. When the group approaches the ceiling, the
+kernel starts reclaiming: it **drops clean page cache** immediately (there is
+nothing to push to disk - the pages are already on disk), and writes dirty
+pages back first. When there is nothing left to reclaim, it has one final
+tool - the **OOM killer**.
 
 The OOM killer is the hammer. When a cgroup hits its memory ceiling and cannot
 free anything else, the kernel picks a process inside the group and kills it.
-It scores candidate processes and picks the one it deems least important (the
-"badness" heuristic favors big, recently-started processes). This is why you
-see your container's process get `Killed` with no error message - the kernel
-chose it to relieve the pressure.
+It scores candidates by how much memory they are using, adjusted by each
+process's `oom_score_adj` (a bias you can set from userspace) - the bigger the
+charge, the more likely the kill. This is why you see your container's process
+get `Killed` with no error message - the kernel chose it to relieve the
+pressure.
 
 There is a much-loved escape hatch: the `memory.oom.group` file. With it set,
-the kernel kills *the whole group* instead of picking one victim. If a single
-process in a container runs out of memory, the entire container is restarted
-cleanly - which Kubernetes and orchestrators generally prefer to a half-dead
-container limping along.
+the kernel kills *the whole group* instead of picking one victim, so a
+runaway container dies as a unit rather than limping along half-dead. Note
+that cgroups only do the killing - the restart that follows is your
+orchestrator's job, which sees the container exit and recreates it.
 
 ```text
 echo 1 > /sys/fs/cgroup/myapp/memory.oom.group
@@ -306,6 +323,13 @@ flag or an unbounded cache produces.
    kills the big allocator.
 6. The container's main process dies. If `memory.oom.group` is set, the whole
    container dies at once.
+
+```mermaid
+graph LR
+    A["app allocates<br/>1 GB slice"] -->|"hits memory.max (512 MB)"| B["kernel reclaims:<br/>drops cache, swaps"]
+    B -->|"still not enough"| C["OOM killer<br/>scores by usage + oom_score_adj"]
+    C -->|"kills the allocator"| D["container exits<br/>Killed / exit 137"]
+```
 
 Your log shows `Killed` or exit code 137 (128 + 9, SIGKILL). No friendly
 error, no stack trace - just the kernel's arithmetic deciding one process was

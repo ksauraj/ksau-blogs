@@ -75,12 +75,20 @@ for each pending pod:
     if not feasible:
         mark pod unschedulable, wait and retry
     else:
-        winner = argmax(nodes, key=n -> score(n, pod))  # SCORE
+        winner = argmax(feasible, key=n -> score(n, pod))  # SCORE
         bind(winner, pod)                                # write nodeName
 ```
 
 That is the entire algorithm. Everything else in the scheduler is detail about
 what `passes()` and `score()` actually check. Let us look at each.
+
+```mermaid
+graph LR
+    P["pending pod"] --> F["FILTER<br/>requests, affinity,<br/>taints, ports, pressure"]
+    F -->|"fails any"| X["node excluded"]
+    F -->|"passes all"| S["SCORE<br/>LeastAllocated, ImageLocality,<br/>affinity, spread ..."]
+    S -->|"weighted sum<br/>highest wins"| B["bind: write nodeName"]
+```
 
 ## Filtering: the hard constraints
 
@@ -132,18 +140,23 @@ Now the scheduler has a list of *feasible* nodes, and it must pick one. This
 is where the competition happens. Each node is scored 0-100 by a set of
 **scoring plugins**, and the node with the highest total wins.
 
-The most important scorer is **LeastRequested** (sometimes called
-MostAllocated on the flip side). It prefers the node with the most free
-resources - it spreads pods out rather than piling them onto one node:
+The default resource scorer is **NodeResourcesFit**, and its default strategy
+is **LeastAllocated**: it prefers the node with the most free resources, so
+pods spread out rather than pile onto one node:
 
 ```text
 node A: 90% allocated → score low
 node B: 30% allocated → score high
 ```
 
-So the scheduler naturally balances load across the cluster - not because it
-is optimizing, but because "most free resources" is a heavy-weighted
-preference.
+The strategy is configurable. **MostAllocated** is the opposite - it
+bin-packs pods onto as few nodes as possible (useful when you want to keep
+nodes consolidated or shut idle ones down) - and **RequestedToCapacityRatio**
+lets you define a custom scoring curve. None of these dominates by default,
+though: every enabled scoring plugin contributes, and a node's final score is
+the **weighted sum of all plugins** - each normalized to 0-100, multiplied by
+its configured weight. LeastAllocated is one vote in that sum, not the whole
+election.
 
 Other scorers add nuance. **ImageLocality** prefers a node that already has
 the pod's image pulled (saves download time). **NodeAffinity** scoring gives a
@@ -151,9 +164,9 @@ slight bonus if the pod *prefers* (not requires) a node. **Spread** plugins
 try to place replicas of the same workload across different nodes or zones.
 
 The final choice is the argmax: highest total score wins. Ties are broken
-arbitrarily (round-robin), which is why two identical pods of the same
-Deployment can land on different nodes - the scores tied and the tiebreak
-spread them.
+randomly, which is why two identical pods of the same Deployment can land on
+different nodes - their candidate sets scored the same, and the winner was
+picked at random from the equal-scoring set.
 
 ## The three scheduling features that build on this
 
@@ -204,10 +217,13 @@ running).
 ### Topology spread: keep replicas apart
 
 TopologySpreadConstraints make sure replicas of a workload spread across
-zones or nodes. It is implemented as a **scoring plugin** - it penalizes nodes
-in zones that already host many pods from the same workload, so the next
-replica goes somewhere underrepresented. You get multi-zone resilience without
-any placement magic - just a score that dislikes crowding.
+zones or nodes. Whether they act as a filter or a score depends on the
+`whenUnsatisfiable` field: `DoNotSchedule` makes the spread a **hard
+constraint** - any node that would push a topology domain past `maxSkew` is
+filtered out, and if nothing fits, the pod stays unscheduled - while
+`ScheduleAnyway` turns it into a **soft score** that penalizes already-crowded
+domains but never refuses a placement. So the same feature can sit in either
+phase, depending on how strictly you configure it.
 
 ## What the scheduler is not
 
@@ -246,8 +262,8 @@ Pod: nginx, requests cpu: 500m, memory: 256Mi
 
 **Score phase:**
 
-- worker-a: 3.5 CPU free, 7 GB free → LeastRequested score: mid (say 40).
-- worker-c: 3.5 CPU free, 6 GB free → LeastRequested score: slightly higher
+- worker-a: 3.5 CPU free, 7 GB free → LeastAllocated score: mid (say 40).
+- worker-c: 3.5 CPU free, 6 GB free → LeastAllocated score: slightly higher
   (say 42). ImageLocality: worker-c already has the nginx image → +10.
 
 **Winner:** worker-c, total 52 vs 40. The pod goes to worker-c.
