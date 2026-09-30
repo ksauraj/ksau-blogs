@@ -106,7 +106,7 @@ pod already there. If the remaining is less than what the new pod asks for,
 the node is filtered out.
 
 ```text
-node capacity:       8 CPU, 16 GB
+node allocatable:    8 CPU, 16 GB
 already requested:   5 CPU, 11 GB
 free:                3 CPU,  5 GB
 new pod requests:    2 CPU,  4 GB   →  fits, passes the filter

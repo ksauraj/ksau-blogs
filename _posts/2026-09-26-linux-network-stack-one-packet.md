@@ -207,11 +207,11 @@ Here is where the theory pays rent, with three real situations you will meet.
 Because softirqs process packets, and softirqs run on a CPU core, a high
 packet rate can pin one core at 100% handling interrupts - while the other
 cores sit idle. This is the classic "one core on fire" load balancer problem.
-The fix is to spread work across cores: **RSS** (Receive Side Scaling) splits
-incoming flows across the NIC's RX queues, **RPS** (Receive Packet Steering)
-does the spreading in software on queues the NIC does not provide, and setting
-**IRQ affinity** pins each queue's interrupt to a specific core so the work and
-the interrupt land on the same CPU.
+The fix is to spread work across cores: **RSS** (Receive Side Scaling)
+distributes incoming flows across hardware RX queues, and **IRQ affinity**
+controls which CPUs handle those queues' interrupts. **RPS** (Receive Packet
+Steering) can spread upper-stack receive processing onto other CPUs in
+software, which can help when there are fewer hardware queues than CPUs.
 
 ### Lesson 2: Why tuning the NIC ring matters
 

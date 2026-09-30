@@ -290,8 +290,9 @@ resources:
     memory: "512Mi"
 ```
 
-The **kubelet** on the node translates those into cgroup files for the pod's
-cgroup. Here is the mapping:
+The **kubelet** on the node passes each container's requests and limits to the
+runtime, which configures that container's cgroup. Kubernetes also manages a
+parent Pod cgroup. Here is the mapping:
 
 | Kubernetes field | cgroup impact | Effect |
 |---|---|---|
@@ -312,8 +313,9 @@ instant wall - the kernel first reclaims (dropping page cache, swapping), and
 only OOM-kills when nothing else can be freed.
 
 That is why a container that "is using more memory than its limit" does not
-fail - it gets *throttled* or *OOM-killed*, depending on which resource and
-which file governs.
+fail in the same way as a CPU hog. CPU quota exhaustion causes throttling. At
+`memory.max`, the kernel attempts reclaim and may OOM-kill if it cannot reduce
+usage; usage can briefly exceed the limit.
 
 ## A worked example: the runaway process
 
@@ -333,9 +335,9 @@ To run it that way, cap swap to the memory limit so nothing spills to disk:
 docker run --memory=512m --memory-swap=512m myapp
 ```
 
-(`--memory-swap=512m` matches swap to memory, so the container cannot swap past
-its 512 MB cap. Without that, a host with swap available could absorb the 1 GB
-and delay the OOM.)
+(`--memory-swap` is the combined RAM + swap budget, so setting both flags to
+512m gives a 512 MiB RAM limit and zero swap allowance. Without that, a host
+with swap available could absorb the 1 GB and delay the OOM.)
 
 1. The program allocates and writes to the slice; each touched page is
    charged to the cgroup.
