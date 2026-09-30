@@ -230,10 +230,14 @@ process table (the kernel's `PID_MAX`), which begins to break the machine for
 
 Now that cgroup cannot spawn more than 1024 simultaneous processes. When a new
 `fork()` would exceed it, the kernel simply refuses - the process gets `Resource
-temporarily unavailable` instead of the host running out of PIDs.
+temporarily unavailable` instead of the host running out of PIDs. The counter
+includes **threads** too: a cgroup at its pids limit cannot create a new thread
+either, so thread-spamming workloads hit the same wall.
 
-This is why Kubernetes `PodSpec` lets you set a max process count, and why
-leaky workloads get contained instead of collapsing the node.
+One Kubernetes clarification: there is no per-Pod PID limit in the Pod spec.
+The limit is set on the **kubelet** - `podPidsLimit` in the kubelet config, or
+`--pod-max-pids` as a flag - and the kubelet writes it into each pod's cgroup.
+Leaky workloads get contained that way instead of collapsing the node.
 
 ## Putting it together: what Docker actually does
 
@@ -290,16 +294,19 @@ cgroup. Here is the mapping:
 |---|---|---|
 | `requests.cpu` | `cpu.weight` | share of CPU when node is busy |
 | `limits.cpu` | `cpu.max` | hard ceiling, throttled |
-| `requests.memory` | `memory.low` | protected from reclaim, soft |
+| `requests.memory` | `memory.low` (best effort) | may be protected from reclaim; runtime-dependent |
 | `limits.memory` | `memory.max` | hard ceiling, OOM-kill trigger |
 
 The subtle point - and the one that trips up production teams - is that
 Kubernetes **requests** and **limits** are different kinds of things. Requests
-are a *weight* (the `cpu.weight` and `memory.low` family): they guarantee a
-share and protect against reclaim. Limits are a *hard ceiling* (the `cpu.max`
-and `memory.max` family): they cap and throttle. A pod with no limit can
-burst to the whole node. A pod with a limit is cut off the moment it reaches
-it.
+are a *weight*: for CPU that maps to `cpu.weight`, a guaranteed share when the
+node is busy. For memory it is looser - the docs say the runtime *may* protect
+request-guaranteed memory via `memory.low`, but that is best effort and
+depends on the runtime, not a hard guarantee. Limits are a *hard ceiling*
+(the `cpu.max` and `memory.max` family): they cap and throttle. A pod with no
+limit can burst to the whole node. A pod with a memory limit is not cut off at
+an instant wall - the kernel first reclaims (dropping page cache, swapping),
+and only OOM-kills when nothing else can be freed.
 
 That is why a container that "is using more memory than its limit" does not
 fail - it gets *throttled* or *OOM-killed*, depending on which resource and
@@ -311,10 +318,13 @@ Let us watch the whole thing happen with a concrete example, because this is
 where the theory stops being abstract.
 
 You run a container with a 512 MB memory limit. Inside, a Go program
-allocates a 1 GB slice in a loop - a genuine bug, the kind a leftover debug
-flag or an unbounded cache produces.
+allocates a 1 GB slice and writes to it in a loop - a genuine bug, the kind a
+leftover debug flag or an unbounded cache produces. The writing matters:
+allocating alone only reserves virtual address space, and the kernel only
+charges pages to the cgroup once the program actually touches them.
 
-1. The program allocates, and the kernel happily hands out anonymous pages.
+1. The program allocates and writes to the slice; each touched page is
+   charged to the cgroup.
 2. The cgroup's `memory.current` climbs toward `memory.max` (512 MB).
 3. As it approaches, the kernel reclaims: it drops the container's page cache,
    swaps out what it can.
@@ -333,7 +343,11 @@ graph LR
 
 Your log shows `Killed` or exit code 137 (128 + 9, SIGKILL). No friendly
 error, no stack trace - just the kernel's arithmetic deciding one process was
-the right sacrifice to keep the rest of the machine alive.
+the right sacrifice to keep the rest of the machine alive. One caution:
+137 means the process died from SIGKILL, which is what the OOM killer sends -
+but SIGKILL also arrives from `kill -9`, a runtime shutdown, or a probe. Exit
+137 alone is not proof of OOM; check `dmesg` for the kernel's OOM message if
+you need certainty.
 
 ## The one mental model to keep
 
