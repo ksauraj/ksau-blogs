@@ -87,17 +87,20 @@ bytes of payload per packet:
 your 64 KB write()  →  ~44 packets of ~1460 bytes each
 ```
 
-One nuance: if the NIC supports **TSO/GSO** (TCP/generic segmentation
-offload), the kernel may hand the NIC one large buffer and let the hardware do
-the actual splitting, which saves CPU. The segmentation still happens - just
-later, in the NIC.
+One nuance: segmentation offload moves the splitting later in the path. **TSO**
+(TCP segmentation offload) lets a NIC that supports it do the TCP segmentation
+in hardware from one large buffer, and **GSO** (generic segmentation offload)
+does the same split in software, in the driver or stack, when the NIC has no
+TSO. Either way the *wire packets still fit the MTU* - the offload just saves
+CPU by not doing the split up in the TCP layer.
 
 Each segment gets a sequence number, a destination port, a window size, and
 gets queued for transmission. The sender's **congestion window** - how much
 in-flight data it allows itself - grows as acknowledgements come back (that is
-the slow start / congestion avoidance dance), and it only **shrinks on
-congestion signals**: packet loss, or explicit congestion notification (ECN).
-Slow acknowledgements alone do not shrink it. All of this happens invisibly,
+the slow start / congestion avoidance dance), and it shrinks on **congestion
+signals**: packet loss or explicit congestion notification (ECN). Loss and ECN
+are the big ones, but an idle interval can also let it drop, and delayed ACKs
+by themselves do not necessarily reduce it. All of this happens invisibly,
 inside the kernel.
 
 The kernel does one more thing here: it attaches a **socket buffer** (`skb`)
@@ -137,10 +140,11 @@ it can accept more.
 
 ## The NIC driver and the ring buffer
 
-Now we are at the bottom. A NIC has one or more **TX and RX queues** - modern
-multi-queue NICs expose one queue pair per CPU core, tuned with `ethtool -L` -
-and each queue is backed by a **DMA ring**: a ring of descriptors pointing at
-kernel memory where the packet data lives.
+Now we are at the bottom. A NIC has one or more **TX and RX queues** - the
+queue count is set by the NIC itself and its driver, and you inspect and
+sometimes change it with `ethtool -L` - and each queue is backed by a **DMA
+ring**: a ring of descriptors pointing at kernel memory where the packet data
+lives.
 
 The driver allocates a set of **descriptors** (small structures pointing at
 kernel memory where the packet data lives) and hands them to the NIC. The NIC
@@ -203,8 +207,11 @@ Here is where the theory pays rent, with three real situations you will meet.
 Because softirqs process packets, and softirqs run on a CPU core, a high
 packet rate can pin one core at 100% handling interrupts - while the other
 cores sit idle. This is the classic "one core on fire" load balancer problem.
-The fix is usually **RPS** (Receive Packet Steering) or a multi-queue NIC
-(`ethtool -L`) so incoming packets spread across cores.
+The fix is to spread work across cores: **RSS** (Receive Side Scaling) splits
+incoming flows across the NIC's RX queues, **RPS** (Receive Packet Steering)
+does the spreading in software on queues the NIC does not provide, and setting
+**IRQ affinity** pins each queue's interrupt to a specific core so the work and
+the interrupt land on the same CPU.
 
 ### Lesson 2: Why tuning the NIC ring matters
 
@@ -244,6 +251,7 @@ have a tuning knob. The stack is not a magic black box; it is a set of
 well-named queues with well-understood behavior.
 
 Now, when you see `rx_dropped` climb or one core peg out under traffic, you
-know exactly which queue is overflowing and which knob to turn. That is the
-whole point of understanding the stack - not to memorize layers, but to know
-where the work actually happens.
+know which queues and counters to investigate before choosing a tuning knob -
+not a single answer, but a map of where to look. That is the whole point of
+understanding the stack - not to memorize layers, but to know where the work
+actually happens.

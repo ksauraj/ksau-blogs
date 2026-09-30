@@ -58,8 +58,8 @@ everything in the group combined. A container is really just a group: the
 kernel puts every process of the container into one cgroup and applies limits
 to that group.
 
-The second-generation implementation is called **cgroups v2**. It first
-appeared in kernel 4.5 (2016) and is now what modern distributions and
+The second-generation implementation is called **cgroups v2**. It became
+official in kernel 4.5 (2016) and is now what modern distributions and
 container runtimes use. We use v2 throughout, and I flag the few places where
 the older v1 behaved differently.
 
@@ -126,10 +126,11 @@ that step and `memory.max` will not exist inside `myapp`. (The plain
 `echo > file` in steps 3-4 would also fail without root - the writes need to
 go through `sudo tee`.)
 
-That is the whole magic. You just created a memory cap, and the kernel will
-now enforce it on everything in `myapp`. If processes in the group try to use
-more than 100 MB, they get slowed down, and if they keep going, they get
-killed. No daemon, no magic - just the kernel reading a number out of a file.
+That is the whole magic. You created a memory cap, and the kernel now
+enforces it on everything in `myapp`. When the group approaches `memory.max`,
+the kernel attempts reclaim - and if usage still cannot be brought down, it may
+invoke the cgroup's OOM killer. No daemon, no magic - just the kernel reading a
+number out of a file.
 
 ## The CPU controller: shares and caps
 
@@ -153,9 +154,9 @@ container-b   cpu.weight = 200
 
 If both containers are running flat out, the kernel divides CPU time in
 proportion to the weights. Container-b gets twice as much as container-a:
-about 66% vs 33%. If container-b goes quiet, container-a can use the whole
-machine - shares are a *floor you are guaranteed*, not a *cap you cannot
-exceed*.
+about 66% vs 33%. This is a **relative share under contention**, not a
+guaranteed floor: if container-b goes quiet, container-a can use the whole
+machine.
 
 This is the single most common confusion. People write `cpu.weight` and expect
 "this container may use at most X%". That is not what shares mean. Shares say
@@ -275,7 +276,9 @@ graph LR
 
 ## How Kubernetes maps to cgroups
 
-Kubernetes sits one layer up. When you write a Pod spec with:
+Kubernetes sits one layer up. Container resources are enforced through the
+container runtime, which creates a cgroup per pod and per container. This is a
+*container resources fragment* from a Pod spec:
 
 ```yaml
 resources:
@@ -290,23 +293,23 @@ resources:
 The **kubelet** on the node translates those into cgroup files for the pod's
 cgroup. Here is the mapping:
 
-| Kubernetes field | cgroup file | Effect |
+| Kubernetes field | cgroup impact | Effect |
 |---|---|---|
-| `requests.cpu` | `cpu.weight` | share of CPU when node is busy |
+| `requests.cpu` | `cpu.weight` typically | relative CPU share under contention |
 | `limits.cpu` | `cpu.max` | hard ceiling, throttled |
-| `requests.memory` | `memory.low` (best effort) | may be protected from reclaim; runtime-dependent |
+| `requests.memory` | `memory.low`/`memory.min` hints | mainly guides scheduling; runtime may protect, best effort |
 | `limits.memory` | `memory.max` | hard ceiling, OOM-kill trigger |
 
 The subtle point - and the one that trips up production teams - is that
 Kubernetes **requests** and **limits** are different kinds of things. Requests
-are a *weight*: for CPU that maps to `cpu.weight`, a guaranteed share when the
-node is busy. For memory it is looser - the docs say the runtime *may* protect
-request-guaranteed memory via `memory.low`, but that is best effort and
-depends on the runtime, not a hard guarantee. Limits are a *hard ceiling*
-(the `cpu.max` and `memory.max` family): they cap and throttle. A pod with no
-limit can burst to the whole node. A pod with a memory limit is not cut off at
-an instant wall - the kernel first reclaims (dropping page cache, swapping),
-and only OOM-kills when nothing else can be freed.
+are mainly a *scheduling promise*: for CPU they typically become a `cpu.weight`
+(a relative share under contention), while memory requests mostly guide
+scheduling and *may* produce `memory.low`/`memory.min` hints the runtime can
+honor - best effort, not a hard guarantee. Limits are a *hard ceiling* (the
+`cpu.max` and `memory.max` family): they cap and throttle. A pod with no limit
+can burst to the whole node. A pod with a memory limit is not cut off at an
+instant wall - the kernel first reclaims (dropping page cache, swapping), and
+only OOM-kills when nothing else can be freed.
 
 That is why a container that "is using more memory than its limit" does not
 fail - it gets *throttled* or *OOM-killed*, depending on which resource and
@@ -317,17 +320,28 @@ which file governs.
 Let us watch the whole thing happen with a concrete example, because this is
 where the theory stops being abstract.
 
-You run a container with a 512 MB memory limit. Inside, a Go program
-allocates a 1 GB slice and writes to it in a loop - a genuine bug, the kind a
-leftover debug flag or an unbounded cache produces. The writing matters:
-allocating alone only reserves virtual address space, and the kernel only
-charges pages to the cgroup once the program actually touches them.
+You run a container with a 512 MB memory limit and swap disabled, so the demo
+is deterministic. Inside, a Go program allocates a 1 GB slice and writes to it
+in a loop - a genuine bug, the kind a leftover debug flag or an unbounded cache
+produces. The writing matters: allocating alone only reserves virtual address
+space, and the kernel only charges pages to the cgroup once the program
+actually touches them.
+
+To run it that way, cap swap to the memory limit so nothing spills to disk:
+
+```bash
+docker run --memory=512m --memory-swap=512m myapp
+```
+
+(`--memory-swap=512m` matches swap to memory, so the container cannot swap past
+its 512 MB cap. Without that, a host with swap available could absorb the 1 GB
+and delay the OOM.)
 
 1. The program allocates and writes to the slice; each touched page is
    charged to the cgroup.
 2. The cgroup's `memory.current` climbs toward `memory.max` (512 MB).
-3. As it approaches, the kernel reclaims: it drops the container's page cache,
-   swaps out what it can.
+3. As it approaches, the kernel reclaims: it drops the container's page cache
+   (there is no swap to fall back on with the limits above).
 4. There is nothing left to reclaim, but the program asks for more.
 5. The kernel invokes the OOM killer, scores the processes in the cgroup, and
    kills the big allocator.
@@ -336,7 +350,7 @@ charges pages to the cgroup once the program actually touches them.
 
 ```mermaid
 graph LR
-    A["app allocates<br/>1 GB slice"] -->|"hits memory.max (512 MB)"| B["kernel reclaims:<br/>drops cache, swaps"]
+    A["app writes<br/>1 GB slice"] -->|"hits memory.max (512 MB)<br/>no swap"| B["kernel reclaims:<br/>drops cache"]
     B -->|"still not enough"| C["OOM killer<br/>scores by usage + oom_score_adj"]
     C -->|"kills the allocator"| D["container exits<br/>Killed / exit 137"]
 ```

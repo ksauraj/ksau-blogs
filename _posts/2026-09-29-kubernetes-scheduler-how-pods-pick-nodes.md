@@ -15,12 +15,12 @@ understood parts of the control plane - partly because it works so well that
 you never need to look at it, and partly because people assume it involves
 some kind of clever optimization.
 
-It does not. The scheduler is a two-step pipeline that runs thousands of times
-a second: **filter** out nodes that cannot host the pod, then **score** the
-ones that remain and pick the best. That is the whole design. This post builds
-that pipeline from scratch - the scheduling loop, the hard constraints, the
-soft preferences, and the features that hang off it (affinity, taints,
-topology spread).
+It does not. At its core the scheduler is a two-step pipeline: **filter** out
+nodes that cannot host the pod, then **score** the ones that remain and pick
+the best. (That is a simplification - the real framework has more stages, and
+we refine it below.) This post builds that pipeline from scratch - the
+scheduling loop, the hard constraints, the soft preferences, and the features
+that hang off it (affinity, taints, topology spread).
 
 No control-plane experience needed. If you have ever wondered "why did my pod
 land *there*?" - this is the post for you.
@@ -43,8 +43,10 @@ a **control loop** - it watches the API server continuously:
 
 1. The scheduler watches for **unscheduled pods** - pods whose
    `spec.nodeName` is empty.
-2. When one appears, it runs the filter/score pipeline against every node in
-   the cluster.
+2. When one appears, it runs a filter/score pass over the cluster's nodes and
+   binds the winner. (Simplified: the real framework has more stages, and on
+   large clusters the scheduler can stop early once it has found enough
+   feasible nodes, rather than scoring every node in the cluster.)
 3. It writes the winner back to the API server: `spec.nodeName = worker-2`.
 4. The kubelet on `worker-2` sees the assignment, talks to the container
    runtime, and starts the pod's containers.
@@ -57,7 +59,7 @@ the agent that reacts to it.
 ```mermaid
 graph LR
     API["API server"] -->|"watch: unscheduled pods"| SCH["scheduler"]
-    SCH -->|"filter + score all nodes"| SCH
+    SCH -->|"filter + score<br/>(simplified)"| SCH
     SCH -->|"write nodeName"| API
     API -->|"watch: my pod has a node"| KUBE["kubelet on worker-2"]
     KUBE -->|"create containers"| CRI["container runtime"]
@@ -79,8 +81,10 @@ for each pending pod:
         bind(winner, pod)                                # write nodeName
 ```
 
-That is the entire algorithm. Everything else in the scheduler is detail about
-what `passes()` and `score()` actually check. Let us look at each.
+That is the core of the algorithm, simplified: filter, score, bind. The real
+framework has additional stages and plugins, and binding happens as a separate
+step at the end. Everything else here is detail about what `passes()` and
+`score()` actually check.
 
 ```mermaid
 graph LR
@@ -127,9 +131,11 @@ matching toleration is filtered out.
 same node (`hostPort: 8080`), the second one is filtered out - the node cannot
 serve both.
 
-**5. Disk pressure, memory pressure, PID pressure.** The scheduler also
-listens to node health signals. A node reporting pressure is filtered out for
-new work until it recovers.
+**5. Disk pressure, memory pressure, PID pressure.** These node conditions do
+not filter directly. The node controller turns them into `NoSchedule` taints
+(for example `node.kubernetes.io/memory-pressure`), and that taint filters out
+new pods exactly like any other taint - which also means a pod carrying the
+matching toleration can still be placed on that node.
 
 These are the hard walls. A node that clears all of them enters the scoring
 phase.
@@ -196,9 +202,11 @@ spec:
 ```
 
 The `required` block is a hard filter - nodes without the GPU role are out.
-The `preferred` block is a soft score - being in `us-east-1a` adds 50 points
-but does not disqualify anything. Same names you saw in the pipeline, just
-with YAML dressing.
+The `preferred` block is a soft score: the `weight` (50 here) feeds the
+NodeAffinity plugin's *raw* score for a node. That raw score is then normalized
+and multiplied by the plugin's own weight before all plugins are combined, so
+the 50 is not 50 points on the final total - and it never disqualifies a node.
+Same names you saw in the pipeline, just with YAML dressing.
 
 ### Taints and tolerations: the flip side
 
@@ -246,7 +254,7 @@ the Vertical Pod Autoscaler exist.
 Let us run the pipeline by hand on a tiny cluster.
 
 ```text
-Cluster: worker-a, worker-b, worker-c  (each 4 CPU, 8 GB)
+Cluster: worker-a, worker-b, worker-c  (each allocatable: 4 CPU, 8 GB)
 
 Pod: nginx, requests cpu: 500m, memory: 256Mi
      nodeSelector:  none
@@ -255,22 +263,27 @@ Pod: nginx, requests cpu: 500m, memory: 256Mi
 
 **Filter phase:**
 
-- worker-a: 3 CPU used, 1 GB used → 3.5 CPU and 7 GB free → passes.
-- worker-b: 3.8 CPU used, 7.5 GB used → 0.2 CPU and 0.5 GB free → fails
-  (not enough CPU for 500m).
-- worker-c: 0.5 CPU used, 2 GB used → 3.5 CPU and 6 GB free → passes.
+- worker-a: 3 CPU requested, 1 GB requested → 1 CPU and 7 GB remain → passes
+  (500m fits).
+- worker-b: 3.8 CPU requested, 7.5 GB requested → 0.2 CPU and 0.5 GB remain →
+  fails (not enough CPU for 500m).
+- worker-c: 0.5 CPU requested, 2 GB requested → 3.5 CPU and 6 GB remain →
+  passes.
 
 **Score phase:**
 
-- worker-a: 3.5 CPU free, 7 GB free → LeastAllocated score: mid (say 40).
-- worker-c: 3.5 CPU free, 6 GB free → LeastAllocated score: slightly higher
-  (say 42). ImageLocality: worker-c already has the nginx image → +10.
+- LeastAllocated favors the node with the most free relative capacity, so
+  worker-c (3.5 CPU free) scores above worker-a (1 CPU free) on the resources
+  plugin.
 
-**Winner:** worker-c, total 52 vs 40. The pod goes to worker-c.
+**Winner:** with resources as the only differentiator in this toy example,
+worker-c comes out ahead. In a real cluster the final pick is the weighted sum
+across every enabled plugin - image locality, affinity, topology spread and the
+rest can tip it the other way - so this is not a guarantee.
 
-That is the scheduler, end to end: two nodes failed the filter, two competed,
-one had the better score. Nothing mystical - just constraints and a
-competition.
+That is the scheduler, end to end, simplified: one node failed the filter, the
+rest competed, and the best score won. Nothing mystical - just constraints and
+a competition.
 
 ## The one mental model to keep
 
