@@ -97,7 +97,12 @@ graph LR
 ## Filtering: the hard constraints
 
 The filter phase answers one question, strictly: *can this node host this pod
-at all?* A node that fails any filter is out, no second chances. The big ones:
+at all?* A node that fails any filter is out, no second chances. And when
+the *entire* cluster fails the filter, the framework's PostFilter stage can
+try **preemption** before the pod just waits: it works out which
+lower-priority pods to evict so the pending pod would fit, and if that
+unblocks it, it does. Only when preemption cannot help does the pod stay
+unscheduled and get retried later. The big ones:
 
 **1. Resource requests.** The node must have enough free CPU and memory for
 the pod's `requests`. The scheduler reads each node's **allocatable**
@@ -118,9 +123,13 @@ limit but a tiny request fits on a node with tiny headroom - which is exactly
 why bursty pods surprise people ("its limit is 8 CPU but it landed on a node
 with 1 CPU free!").
 
-**2. Node selector and affinity.** `nodeSelector` and `nodeAffinity` say "this
-pod must go to a node with these labels" (GPU nodes, region labels, storage
-labels). A node without the required labels fails the filter.
+**2. Node selector and affinity.** `nodeSelector` and *required* node
+affinity restrict the eligible nodes: a pod with such a requirement only
+lands on nodes carrying the matching labels (GPU nodes, region labels,
+storage labels), and a node without the required labels fails the filter.
+*Preferred* node affinity is the other half of the feature: it affects
+scoring instead and never excludes a node on its own (more on it in the
+scoring section).
 
 **3. Taints and tolerations.** Taints are the inverse: a node can be *marked*
 ("this node is for GPU workloads only" via `node-role.kubernetes.io/gpu:NoSchedule`)
@@ -143,8 +152,11 @@ phase.
 ## Scoring: the soft preferences
 
 Now the scheduler has a list of *feasible* nodes, and it must pick one. This
-is where the competition happens. Each node is scored 0-100 by a set of
-**scoring plugins**, and the node with the highest total wins.
+is where the competition happens. Each **scoring plugin** gives each
+feasible node a raw 0-100, the raw scores are multiplied by the plugin's
+weight, and all plugins are summed. So the final total is not capped at 100,
+it is the weighted sum of every enabled plugin, and the node with the
+highest total wins.
 
 The default resource scorer is **NodeResourcesFit**, and its default strategy
 is **LeastAllocated**: it prefers the node with the most free resources, so
@@ -160,8 +172,9 @@ bin-packs pods onto as few nodes as possible (useful when you want to keep
 nodes consolidated or shut idle ones down) - and **RequestedToCapacityRatio**
 lets you define a custom scoring curve. None of these dominates by default,
 though: every enabled scoring plugin contributes, and a node's final score is
-the **weighted sum of all plugins** - each normalized to 0-100, multiplied by
-its configured weight. LeastAllocated is one vote in that sum, not the whole
+the **weighted sum of all plugins** - each normalized to 0-100 after
+optional plugin-specific normalization, then multiplied by its configured
+weight. LeastAllocated is one vote in that sum, not the whole
 election.
 
 Other scorers add nuance. **ImageLocality** prefers a node that already has
@@ -219,8 +232,10 @@ kubectl taint nodes node-a dedicated=gpu:NoSchedule
 
 Now only pods with `tolerations: [{key: dedicated, value: gpu, effect: NoSchedule}]`
 pass the filter for node-a. The `NoSchedule` effect is the filter; there is
-also `PreferNoSchedule` (a score penalty) and `NoExecute` (ejects pods already
-running).
+also `PreferNoSchedule` (a score penalty, still schedulable) and `NoExecute`
+- which does *not* eject every running pod: a pod that carries a matching
+toleration keeps running, and if that toleration sets `tolerationSeconds`,
+the number becomes a countdown to eviction instead of a free pass.
 
 ### Topology spread: keep replicas apart
 
@@ -239,9 +254,12 @@ Two misconceptions come up constantly, and clearing them makes everything
 easier to reason about.
 
 **"The scheduler balances load perfectly."** No. It balances at *scheduling
-time*, once per pod. After that, the pod stays where it is until it dies
-(there is no automatic rescheduling based on live load). A node can drift out
-of balance afterward, and nothing moves until a pod is recreated.
+time*, once per pod. And the default scheduler does not rebalance *running*
+pods: a pod stays on the node it was bound to, and nothing shuffles live
+workloads between nodes to even out load. When a pod dies, its replacement
+is scheduled separately - that is the only moment the balance gets a chance
+to change. So a node can drift out of balance and stay there for as long as
+its pods keep living, and nothing moves them.
 
 **"The scheduler predicts the future."** No. It reads requests (static
 declarations), not actual usage. A pod that requests 250m CPU but actually
@@ -291,10 +309,15 @@ a competition.
 > eliminate impossible nodes, then soft preferences pick the best of what
 > remains, and the winner is written as a single field the kubelet acts on.
 
-Every scheduling feature you will ever configure - requests, nodeSelector,
-affinity, taints, topology spread - is a plug-in to one of those two stages.
-If it starts with *must*, it is a filter. If it has a *weight* or says
-*preferred*, it is a score.
+Most of the placement rules you will ever configure - requests,
+nodeSelector, affinity, taints, topology spread - fit this model: a
+plug-in to one of those two stages. If it starts with *must*, it is a
+filter. If it has a *weight* or says *preferred*, it is a score. The
+framework also has other stages - queueing and backoff, preemption, the
+permit stage where a chosen node can still be rejected, and the final
+bind - but they rarely change what you write in YAML. The two-stage model
+covers the configuration; the rest covers what happens when the cluster
+fights back.
 
 Now, when a pod lands somewhere unexpected, you have the tool to explain it:
 check the filters (does the node have the resources? the labels? a taint it
